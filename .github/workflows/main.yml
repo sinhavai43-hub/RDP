@@ -1,40 +1,118 @@
-name: Tailscale + Enable RDP (self-hosted Windows)
+name: RDP
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
-  tailscale-rdp:
-    runs-on: [self-hosted, windows]
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
-
-      - name: Ensure running as admin (informational)
+      - name: Configure Core RDP Settings
         run: |
-          Write-Host "Checking admin rights..."
-          if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-            Write-Error "This job must run with Administrator privileges on the self-hosted runner."
-            exit 1
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Credentials
+        run: |
+          $username = "TANZIL"
+          $password = "TANZIL@@12"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create user if not exists
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($user) {
+              Write-Host "User exists; updating password."
+              $user | Set-LocalUser -Password $securePass
           } else {
-            Write-Host "Running as Administrator."
+              Write-Host "Creating new local user."
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           }
-        shell: powershell
 
-      - name: Ensure Tailscale installed (winget)
+          # Add user to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # Export credentials for workflow logs
+          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name $username)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
         run: |
-          Write-Host "Checking if Tailscale is installed..."
-          $exists = Get-Command tailscale -ErrorAction SilentlyContinue
-          if (-not $exists) {
-            Write-Host "Installing Tailscale via winget..."
-            winget install --id Tailscale.Tailscale -e --accept-package-agreements --accept-source-agreements
-            Start-Sleep -Seconds 6
-          } else {
-            Write-Host "Tailscale already installed."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: TANZIL"
+          Write-Host "Password: TANZIL@@12"
+          Write-Host "==================`n"
+          
+          # Keep runner active for up to 6 hours (3600 seconds = 1 hour, can repeat loop)
+          $duration = 6 * 60 * 60
+          $start = Get-Date
+          while ((Get-Date) -lt $start.AddSeconds($duration)) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }            Write-Host "Tailscale already installed."
           }
         shell: powershell
 
