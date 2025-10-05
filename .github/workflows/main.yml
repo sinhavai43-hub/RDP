@@ -103,7 +103,7 @@ jobs:
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: TANZIL"
-          Write-Host "Password: TANZIL@@12"
+          Write-Host "Password: TANZIL@12"
           Write-Host "==================`n"
           
           # Keep runner active for up to 6 hours (3600 seconds = 1 hour, can repeat loop)
@@ -112,118 +112,4 @@ jobs:
           while ((Get-Date) -lt $start.AddSeconds($duration)) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
-          }            Write-Host "Tailscale already installed."
           }
-        shell: powershell
-
-      - name: Ensure tailscaled service is running
-        run: |
-          Write-Host "Starting tailscaled if not running..."
-          $svc = Get-Service -Name 'Tailscale' -ErrorAction SilentlyContinue
-          if (-not $svc) {
-            $svc = Get-Service -Name 'tailscaled' -ErrorAction SilentlyContinue
-          }
-          if ($svc) {
-            if ($svc.Status -ne 'Running') {
-              Start-Service -Name $svc.Name
-              Start-Sleep -Seconds 3
-            }
-            Write-Host "Tailscale service ($($svc.Name)) is $($svc.Status)."
-          } else {
-            Write-Host "tailscaled service not found; attempting to start tailscaled.exe directly..."
-            $path = "C:\Program Files\Tailscale IPN\tailscaled.exe"
-            if (Test-Path $path) {
-              Start-Process -FilePath $path -ArgumentList "--cleanup" -NoNewWindow -WindowStyle Hidden
-              Start-Sleep -Seconds 3
-            } else {
-              Write-Error "tailscaled not found. Please verify Tailscale installation path."
-              exit 1
-            }
-          }
-        shell: powershell
-
-      - name: Tailscale up if not authenticated
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          TAILSCALE_HOSTNAME: ${{ secrets.TAILSCALE_HOSTNAME }}
-        run: |
-          Write-Host "Checking Tailscale auth status..."
-          $status = & tailscale status 2>$null
-          if ($LASTEXITCODE -eq 0 -and $status -match "Logged in as") {
-            Write-Host "Tailscale already authenticated."
-          } else {
-            if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is missing. Cannot authenticate."
-              exit 1
-            }
-            Write-Host "Running `tailscale up` with auth key..."
-            & tailscale up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="$env:TAILSCALE_HOSTNAME" --accept-routes --accept-dns
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "tailscale up failed. Check auth key and network connectivity."
-              exit 1
-            }
-            Start-Sleep -Seconds 4
-          }
-        shell: powershell
-
-      - name: (Optional) Create RDP user (defaults to TANZIL / TANZIL@@12 if secrets missing)
-        env:
-          # These read from Secrets if present; otherwise the step will fall back to the defaults below.
-          SECRET_RDP_USER: ${{ secrets.RDP_USER }}
-          SECRET_RDP_PASS: ${{ secrets.RDP_PASS }}
-        run: |
-          # Use secrets if provided, otherwise fallback to the requested defaults:
-          if ($env:SECRET_RDP_USER -and $env:SECRET_RDP_USER -ne "") {
-            $userName = $env:SECRET_RDP_USER
-          } else {
-            $userName = "TANZIL"
-            Write-Host "RDP user secret not provided; falling back to default: $userName"
-          }
-
-          if ($env:SECRET_RDP_PASS -and $env:SECRET_RDP_PASS -ne "") {
-            $userPass = $env:SECRET_RDP_PASS
-            # do not echo secret
-          } else {
-            $userPass = "TANZIL@@12"
-            Write-Host "RDP password secret not provided; falling back to default password (hidden)."
-          }
-
-          Write-Host "Creating/updating local user: $userName"
-          $securePass = ConvertTo-SecureString $userPass -AsPlainText -Force
-          $user = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
-          if ($user) {
-            Write-Host "User exists; updating password."
-            $user | Set-LocalUser -Password $securePass
-          } else {
-            Write-Host "Creating new local user."
-            New-LocalUser -Name $userName -Password $securePass -FullName $userName -PasswordNeverExpires:$true
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName
-          }
-        shell: powershell
-
-      - name: Enable Windows Remote Desktop (RDP) and firewall
-        run: |
-          Write-Host "Enabling Remote Desktop..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-
-          try {
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
-          } catch {
-            Write-Host "Could not enable 'Remote Desktop' firewall group; attempting individual rule enable..."
-            Get-NetFirewallRule -DisplayName "Remote Desktop - User Mode (TCP-In)" -ErrorAction SilentlyContinue | ForEach-Object {
-              $_ | Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
-            }
-          }
-
-          Write-Host "RDP enabled."
-        shell: powershell
-
-      - name: Output Tailscale IP(s) and short status
-        run: |
-          Write-Host "Tailscale IPv4 addresses:"
-          & tailscale ip -4
-          Write-Host "`nTailscale IPv6 addresses (if any):"
-          & tailscale ip -6 || Write-Host "(none)"
-          Write-Host "`nTailscale status summary:"
-          & tailscale status --short
-        shell: powershell
